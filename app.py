@@ -11,15 +11,20 @@ from ai_edge_litert.interpreter import Interpreter
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Existing disease model — keep unchanged
 MODEL_PATH = BASE_DIR / "models" / "arecanut_model.tflite"
 CLASSES_PATH = BASE_DIR / "models" / "class_names.json"
+
+# New leaf / non-leaf detector
+LEAF_MODEL_PATH = BASE_DIR / "models" / "arecanut_leaf_detector.tflite"
 
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_SIZE
 
-# Load model and labels once when the service starts.
+# Load existing disease model and labels
 with open(CLASSES_PATH, "r", encoding="utf-8") as file:
     CLASS_NAMES = json.load(file)
 
@@ -28,6 +33,46 @@ interpreter.allocate_tensors()
 
 INPUT_DETAILS = interpreter.get_input_details()
 OUTPUT_DETAILS = interpreter.get_output_details()
+
+# Load new leaf detector
+leaf_interpreter = Interpreter(model_path=str(LEAF_MODEL_PATH))
+leaf_interpreter.allocate_tensors()
+
+LEAF_INPUT_DETAILS = leaf_interpreter.get_input_details()
+LEAF_OUTPUT_DETAILS = leaf_interpreter.get_output_details()
+
+
+def prepare_leaf_input(image):
+    input_info = LEAF_INPUT_DETAILS[0]
+    input_data = np.asarray(image, dtype=np.float32)
+    input_data = np.expand_dims(input_data, axis=0)
+
+    # Handle quantized input if the model requires it
+    if np.issubdtype(input_info["dtype"], np.integer):
+        scale, zero_point = input_info["quantization"]
+        if scale > 0:
+            input_data = np.round(input_data / scale + zero_point)
+
+    return input_data.astype(input_info["dtype"])
+
+
+def check_arecanut_leaf(image):
+    input_data = prepare_leaf_input(image)
+
+    leaf_interpreter.set_tensor(
+        LEAF_INPUT_DETAILS[0]["index"],
+        input_data
+    )
+    leaf_interpreter.invoke()
+
+    result = leaf_interpreter.get_tensor(
+        LEAF_OUTPUT_DETAILS[0]["index"]
+    )
+
+    leaf_score = float(np.asarray(result).reshape(-1)[0])
+
+    # Model labels: 0 = non_leaf, 1 = arecanut leaf
+    return leaf_score, leaf_score >= 0.5
 
 
 @app.route("/", methods=["GET"])
@@ -43,6 +88,7 @@ def health():
     return jsonify({
         "success": True,
         "model": "MobileNetV2 TFLite",
+        "leaf_detector": "arecanut_leaf_detector.tflite",
         "categories": CLASS_NAMES
     })
 
@@ -75,6 +121,18 @@ def predict_arecanut():
         image = Image.open(image_file.stream).convert("RGB")
         image = image.resize((224, 224))
 
+        # Step 1: Check whether the image is an arecanut leaf
+        leaf_score, is_leaf = check_arecanut_leaf(image)
+
+        if not is_leaf:
+            return jsonify({
+                "success": False,
+                "predicted_category": "non_leaf",
+                "leaf_score_percent": round(leaf_score * 100, 2),
+                "error": "Please upload an arecanut leaf image."
+            }), 422
+
+        # Step 2: Run the existing disease classifier
         input_data = np.asarray(image, dtype=np.float32)
         input_data = np.expand_dims(input_data, axis=0)
 
@@ -82,7 +140,6 @@ def predict_arecanut():
             INPUT_DETAILS[0]["index"],
             input_data
         )
-
         interpreter.invoke()
 
         predictions = interpreter.get_tensor(
@@ -99,6 +156,8 @@ def predict_arecanut():
         return jsonify({
             "success": True,
             "filename": filename,
+            "leaf_check": "arecanut leaf",
+            "leaf_score_percent": round(leaf_score * 100, 2),
             "model": "MobileNetV2 TFLite",
             "predicted_category": CLASS_NAMES[predicted_index],
             "model_score_percent": round(
@@ -119,7 +178,7 @@ def predict_arecanut():
         }), 400
 
     except Exception:
-        app.logger.exception("Disease prediction failed")
+        app.logger.exception("Prediction failed")
         return jsonify({
             "success": False,
             "error": "Prediction service encountered an error."
