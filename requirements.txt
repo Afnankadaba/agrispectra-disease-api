@@ -1,0 +1,5 @@
+Flask
+gunicorn
+numpy
+Pillow
+ai-edge-litert==2.3.0
